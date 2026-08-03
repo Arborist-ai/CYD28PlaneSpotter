@@ -45,13 +45,19 @@ CYD28/
    ```
    cp config.env.example src/config.env
    ```
-3. **Edit `src/config.env`** with your WiFi credentials and OpenSky API keys:
+3. **Edit `src/config.env`** with your WiFi credentials, a password for the web
+   config page, and (optionally) OpenSky API keys:
    ```c
    #define WIFI_SSID "YourWiFi"
    #define WIFI_PASS "YourPassword"
+   #define CONFIG_AUTH_USER "admin"
+   #define CONFIG_AUTH_PASS "pick-something"       // blank disables the web config server
    #define OPENSKY_CLIENT_ID "your-client-id"      // or leave blank for anonymous
    #define OPENSKY_CLIENT_SECRET "your-secret"     // or leave blank for anonymous
    ```
+   Leaving both OpenSky values blank uses anonymous access, which works but has
+   a lower rate limit. With both set, the device performs an OAuth2
+   `client_credentials` exchange and sends a bearer token on each API call.
 4. **Adjust defaults** for your home location if desired:
    ```c
    #define DEFAULT_HOME_LAT      47.5774   // your latitude
@@ -68,6 +74,24 @@ CYD28/
 - **Tap the screen** to cycle through the 4 screens.
 - **On the Radar screen**, tap the **+/- buttons** at the bottom-left to adjust range (10–200 km).
 - **Open the device IP** in a browser to configure location and range.
+
+## Security notes
+
+- **TLS certificates are verified** on every outbound HTTPS request, against the
+  root CA bundle embedded in the ESP-IDF build. Because certificate validity is
+  checked against the system clock, the device waits for NTP before its first
+  request — if the clock never syncs, API calls will fail rather than fall back
+  to an unverified connection.
+- **The web config page requires authentication** (HTTP digest, so the password
+  is not sent in the clear) and `POST /save` additionally requires a per-boot
+  CSRF token, so another site you visit on the same network cannot silently
+  reconfigure the device. The page itself is plain HTTP — keep the device on a
+  network you trust.
+- **WiFi and API credentials are compiled into the firmware** as plaintext and
+  can be recovered from a device by anyone who can read its flash (`esptool.py
+  read_flash`). Enable ESP32 flash encryption if that matters for your
+  deployment.
+- `src/config.env` is gitignored. Keep it that way — it holds your secrets.
 
 ## Dependencies
 
