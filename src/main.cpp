@@ -14,8 +14,10 @@
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <math.h>
+#include <ctype.h>
 #include <time.h>
 #include <sys/time.h>
+#include <esp_random.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -24,6 +26,21 @@
 // CONFIGURATION — loaded from config.env
 // =======================================================================
 #include "config.env"
+
+// Root CA bundle embedded in the ESP-IDF build. Every outbound HTTPS request
+// verifies the server certificate against it — see beginSecure().
+extern const uint8_t rootCaBundle[] asm("_binary_x509_crt_bundle_start");
+
+const uint32_t HTTP_CONNECT_TIMEOUT_MS = 8000;
+const uint32_t HTTP_TIMEOUT_MS = 12000;
+
+// Prepares a TLS client with certificate verification enabled.
+static void beginSecure(WiFiClientSecure& client, HTTPClient& https) {
+  client.setCACertBundle(rootCaBundle);
+  https.setReuse(false);
+  https.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  https.setTimeout(HTTP_TIMEOUT_MS);
+}
 
 // Runtime-configurable location & radar (persisted via NVS)
 // Defaults below; overridden by web UI and saved to flash.
@@ -89,7 +106,6 @@ CachedRoute routeCache[15];
 struct Weather {
   float tempC; float windKmh; int humidity; int code; bool valid = false;
 } weather;
-uint32_t lastWeatherPoll = 0;
 
 struct Stats {
   uint32_t requestsOk = 0; uint32_t requestsFail = 0;
@@ -97,11 +113,41 @@ struct Stats {
   double closestEver = 1e9; uint32_t lastUpdateMs = 0;
 } stats;
 
+// stats is written from the Core 0 fetch task and read by Core 1 rendering.
+// Its own mutex keeps those updates off the long render-time dataMutex hold.
+SemaphoreHandle_t statsMutex = NULL;
+
+template <typename Fn>
+static void withStats(Fn fn) {
+  if (statsMutex) xSemaphoreTake(statsMutex, portMAX_DELAY);
+  fn();
+  if (statsMutex) xSemaphoreGive(statsMutex);
+}
+
+static void recordFailure() { withStats([]{ stats.requestsFail++; }); }
+
+// Consistent copy for the render thread — never read `stats` directly there.
+static Stats statsSnapshot() {
+  Stats copy;
+  withStats([&copy]{ copy = stats; });
+  return copy;
+}
+
+// Radar range buttons — geometry is shared by the drawing and the touch
+// handling so the hit boxes cannot drift away from the rendered rects.
+const int RANGE_BTN_Y = 215, RANGE_BTN_W = 30, RANGE_BTN_H = 20;
+const int RANGE_MINUS_X = 10, RANGE_PLUS_X = 50;
+const int RANGE_BTN_PAD = 4;  // extra touch slop around each button
+
+// Range changes are coalesced before hitting NVS: tapping +/- through the
+// full 10-200 km span would otherwise be 19 flash writes.
+const uint32_t RANGE_SAVE_DELAY_MS = 3000;
+uint32_t rangeSaveDueMs = 0;
+
 uint8_t screen = 0;
 uint8_t lastScreen = 255;
 uint32_t lastScreenSwap = 0;
 uint32_t lastTouchMs = 0;
-bool firstWeatherDone = false;
 const uint8_t NUM_SCREENS = 4; // Reduced from 5 to 4 screens
 const uint32_t SCREEN_SWAP_MS = 10000;
 
@@ -141,6 +187,8 @@ void projectLatLon(double lat, double lon, float trackDeg, double distM, double&
 // ---------------------------------------------------------------------------
 // Network & APIs
 // ---------------------------------------------------------------------------
+bool timeReady();
+
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -152,9 +200,104 @@ void connectWiFi() {
   tft.fillScreen(TFT_BLACK);
 }
 
+// Certificate validity is checked against the system clock, so NTP must land
+// before the first HTTPS request — otherwise every handshake fails on dates.
+void waitForClock(uint32_t timeoutMs) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextFont(4);
+  tft.drawString("Syncing clock...", 20, 100);
+  uint32_t start = millis();
+  while (!timeReady() && millis() - start < timeoutMs) delay(250);
+  if (!timeReady()) Serial.println("WARN: NTP sync timed out; TLS may fail until the clock is set");
+  tft.fillScreen(TFT_BLACK);
+}
+
+// Percent-encodes everything outside the unreserved set (RFC 3986).
+String urlEncode(const char* s) {
+  static const char* hex = "0123456789ABCDEF";
+  String out;
+  for (const char* p = s; *p; ++p) {
+    unsigned char c = (unsigned char)*p;
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += (char)c;
+    } else {
+      out += '%'; out += hex[c >> 4]; out += hex[c & 0x0F];
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// OpenSky OAuth2 (client_credentials). Blank credentials => anonymous access,
+// which is what the API falls back to anyway, just with a lower rate limit.
+// ---------------------------------------------------------------------------
+String openSkyToken;
+uint32_t openSkyTokenExpiresAtMs = 0;
+
+bool openSkyAuthConfigured() {
+  return strlen(OPENSKY_CLIENT_ID) > 0 && strlen(OPENSKY_CLIENT_SECRET) > 0;
+}
+
+bool refreshOpenSkyToken() {
+  WiFiClientSecure client; HTTPClient https;
+  beginSecure(client, https);
+
+  const char* tokenUrl = "https://auth.opensky-network.org/auth/realms/"
+                         "opensky-network/protocol/openid-connect/token";
+  if (!https.begin(client, tokenUrl)) return false;
+
+  https.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  String body = "grant_type=client_credentials&client_id=" + urlEncode(OPENSKY_CLIENT_ID) +
+                "&client_secret=" + urlEncode(OPENSKY_CLIENT_SECRET);
+
+  int code = https.POST(body);
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("OpenSky token request failed (HTTP %d) - continuing anonymously\n", code);
+    https.end();
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, https.getStream());
+  https.end();
+  if (err) return false;
+
+  const char* tok = doc["access_token"] | "";
+  if (!tok[0]) return false;
+
+  // Refresh a minute early so a token never expires mid-request.
+  uint32_t lifetimeS = doc["expires_in"] | 1800;
+  if (lifetimeS > 60) lifetimeS -= 60;
+  openSkyToken = tok;
+  openSkyTokenExpiresAtMs = millis() + lifetimeS * 1000UL;
+  Serial.printf("OpenSky token acquired (valid %us)\n", lifetimeS);
+  return true;
+}
+
+// Attaches a bearer token when credentials are configured. Returns false only
+// if auth was configured but unavailable; callers still proceed anonymously.
+bool applyOpenSkyAuth(HTTPClient& https) {
+  if (!openSkyAuthConfigured()) return true;
+  bool expired = openSkyToken.isEmpty() ||
+                 (int32_t)(millis() - openSkyTokenExpiresAtMs) >= 0;
+  if (expired && !refreshOpenSkyToken()) return false;
+  https.addHeader("Authorization", "Bearer " + openSkyToken);
+  return true;
+}
+
+// Callsigns arrive from ADS-B broadcasts, so they are untrusted input that
+// ends up in a request path. Only plain alphanumerics are legitimate.
+bool callsignIsUrlSafe(const char* callsign) {
+  for (const char* p = callsign; *p; ++p)
+    if (!isalnum((unsigned char)*p)) return false;
+  return true;
+}
+
 bool getRoute(const char* callsign, char* dep, char* arr) {
   if (strlen(callsign) == 0 || strcmp(callsign, "(no id)") == 0) return false;
-  
+  if (!callsignIsUrlSafe(callsign)) return false;
+
   for (int i=0; i<15; i++) {
     if (routeCache[i].valid && strcmp(routeCache[i].callsign, callsign) == 0) {
       if (routeCache[i].dep[0]) {
@@ -166,9 +309,9 @@ bool getRoute(const char* callsign, char* dep, char* arr) {
     }
   }
 
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient https; https.setReuse(false);
-  String url = String("https://hexdb.io/api/v1/route/icao/") + callsign;
+  WiFiClientSecure client; HTTPClient https;
+  beginSecure(client, https);
+  String url = String("https://hexdb.io/api/v1/route/icao/") + urlEncode(callsign);
   bool found = false;
   dep[0] = '\0'; arr[0] = '\0';
 
@@ -176,7 +319,7 @@ bool getRoute(const char* callsign, char* dep, char* arr) {
     int code = https.GET();
     if (code == HTTP_CODE_OK) {
       JsonDocument d;
-      if (!deserializeJson(d, https.getString())) {
+      if (!deserializeJson(d, https.getStream())) {
         const char* r = d["route"] | "";
         const char* dash = strchr(r, '-');
         if (r[0] && dash) {
@@ -216,24 +359,38 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   hLat = homeLat; hLon = homeLon; sRad = searchRadiusDeg; rMax = radarMaxKm;
   if (configMutex) xSemaphoreGive(configMutex);
 
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient https; https.setReuse(false);
-  String url = "https://opensky-network.org/api/states/all?lamin=" + String(hLat - sRad, 4) + 
-         "&lomin=" + String(hLon - sRad, 4) + "&lamax=" + String(hLat + sRad, 4) + 
+  WiFiClientSecure client; HTTPClient https;
+  beginSecure(client, https);
+  String url = "https://opensky-network.org/api/states/all?lamin=" + String(hLat - sRad, 4) +
+         "&lomin=" + String(hLon - sRad, 4) + "&lamax=" + String(hLat + sRad, 4) +
          "&lomax=" + String(hLon + sRad, 4) + "&extended=1";
 
-  if (!https.begin(client, url)) { stats.requestsFail++; return false; }
+  if (!https.begin(client, url)) { recordFailure(); return false; }
+  applyOpenSkyAuth(https);
+
   int code = https.GET();
-  if (code != HTTP_CODE_OK) { https.end(); stats.requestsFail++; return false; }
+  // A rejected token is usually an expired one — drop it and retry once.
+  if (code == HTTP_CODE_UNAUTHORIZED && openSkyAuthConfigured()) {
+    openSkyToken = "";
+    https.end();
+    if (!https.begin(client, url)) { recordFailure(); return false; }
+    applyOpenSkyAuth(https);
+    code = https.GET();
+  }
+  if (code != HTTP_CODE_OK) { https.end(); recordFailure(); return false; }
 
   JsonDocument filter;
   JsonArray el = filter["states"].to<JsonArray>().add<JsonArray>();
   for (int i = 0; i <= 17; i++) el[i] = false;
   el[0] = el[1] = el[2] = el[5] = el[6] = el[7] = el[8] = el[9] = el[10] = el[11] = el[13] = el[17] = true;
 
-  String payload = https.getString(); https.end();
+  // Parse straight off the socket — buffering the whole body into a String
+  // first doubles peak heap on a busy search box.
   JsonDocument doc;
-  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) { stats.requestsFail++; return false; }
+  DeserializationError jsonErr =
+      deserializeJson(doc, https.getStream(), DeserializationOption::Filter(filter));
+  https.end();
+  if (jsonErr) { recordFailure(); return false; }
 
   JsonArray states = doc["states"].as<JsonArray>();
   uint16_t count = 0; 
@@ -288,13 +445,18 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     }
   }
 
-  stats.inView = count; if (count > stats.maxInView) stats.maxInView = count;
-  stats.requestsOk++;
+  withStats([count]{
+    stats.inView = count;
+    if (count > stats.maxInView) stats.maxInView = count;
+    stats.requestsOk++;
+  });
 
   if (top5CntOut > 0) {
     nearOut = top5Out[0];
-    if (nearOut.distanceKm < stats.closestEver)
-      stats.closestEver = nearOut.distanceKm;
+    withStats([&nearOut]{
+      if (nearOut.distanceKm < stats.closestEver)
+        stats.closestEver = nearOut.distanceKm;
+    });
   } else {
     nearOut.valid = false;
   }
@@ -305,6 +467,8 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
 // ===================================================================
 // Background Data Fetcher — runs on Core 0 so Core 1 stays smooth
 // ===================================================================
+bool fetchWeather();
+
 void dataFetcherTask(void* param) {
   // Local work buffers — all blocking HTTP happens here
   Aircraft locTop5[MAX_TOP5];
@@ -313,11 +477,24 @@ void dataFetcherTask(void* param) {
   uint8_t locBlipCount = 0;
   Aircraft locNearest;
   locNearest.valid = false;
+  uint32_t lastWeatherFetch = 0;
+  bool weatherFetched = false;
 
   for (;;) {
     // Wait for the next poll interval (sleep in 1s chunks so task is responsive)
     for (int t = 0; t < UPDATE_INTERVAL_MS / 1000; t++) {
       vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    // TLS verification needs a valid clock, so hold off until NTP lands.
+    if (WiFi.status() != WL_CONNECTED || !timeReady()) continue;
+
+    // Weather shares this task: on Core 1 its blocking HTTPS call stalled
+    // rendering for the duration of the request.
+    if (!weatherFetched || millis() - lastWeatherFetch >= WEATHER_INTERVAL_MS) {
+      fetchWeather();
+      lastWeatherFetch = millis();
+      weatherFetched = true;
     }
 
     fetchInProgress = true;
@@ -339,9 +516,10 @@ void dataFetcherTask(void* param) {
       top5Count = locTop5Count;
       nearest = locNearest;
       lastDataMs = millis();
-      stats.lastUpdateMs = lastDataMs;
+      uint32_t publishedAt = lastDataMs;
       newDataReady = true;
       xSemaphoreGive(dataMutex);
+      withStats([publishedAt]{ stats.lastUpdateMs = publishedAt; });
     }
   }
 }
@@ -353,18 +531,24 @@ bool fetchWeather() {
   hLat = homeLat; hLon = homeLon;
   if (configMutex) xSemaphoreGive(configMutex);
 
-  WiFiClientSecure client; client.setInsecure(); HTTPClient https; https.setReuse(false);
+  WiFiClientSecure client; HTTPClient https;
+  beginSecure(client, https);
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(hLat, 4) + "&longitude=" + String(hLon, 4) + "&current=temperature_2m,relative_humidity_2m,wind_speed_10m";
   if (!https.begin(client, url)) return false;
   int code = https.GET();
   if (code != HTTP_CODE_OK) { https.end(); return false; }
-  String payload = https.getString(); https.end();
 
-  JsonDocument doc; if (deserializeJson(doc, payload)) return false;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, https.getStream());
+  https.end();
+  if (err) return false;
   JsonObject c = doc["current"]; if (c.isNull()) return false;
-  
+
+  // Published to the render thread, which reads weather under dataMutex.
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
   weather.tempC = c["temperature_2m"] | 0.0f; weather.humidity = c["relative_humidity_2m"] | 0;
   weather.windKmh = c["wind_speed_10m"] | 0.0f; weather.valid = true;
+  if (dataMutex) xSemaphoreGive(dataMutex);
   return true;
 }
 
@@ -599,16 +783,16 @@ void screenRadar(bool newPage) {
   char rng[16]; snprintf(rng, sizeof(rng), "RNG %d km", (int)rMax);
   tft.drawString(rng, 10, 193);
 
-  // "-" button (left, 30x20)
-  tft.fillRoundRect(10, 215, 30, 20, 4, TFT_DARKGREY);
+  // "-" button (left)
+  tft.fillRoundRect(RANGE_MINUS_X, RANGE_BTN_Y, RANGE_BTN_W, RANGE_BTN_H, 4, TFT_DARKGREY);
   tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
   tft.setTextFont(2);
-  tft.setTextPadding(30);
-  tft.drawString("-", 20, 216);
+  tft.setTextPadding(RANGE_BTN_W);
+  tft.drawString("-", RANGE_MINUS_X + RANGE_BTN_W / 3, RANGE_BTN_Y + 1);
 
-  // "+" button (right of "-", 30x20)
-  tft.fillRoundRect(50, 215, 30, 20, 4, TFT_DARKGREY);
-  tft.drawString("+", 60, 216);
+  // "+" button (right of "-")
+  tft.fillRoundRect(RANGE_PLUS_X, RANGE_BTN_Y, RANGE_BTN_W, RANGE_BTN_H, 4, TFT_DARKGREY);
+  tft.drawString("+", RANGE_PLUS_X + RANGE_BTN_W / 3, RANGE_BTN_Y + 1);
 
   tft.setTextPadding(0);
 }
@@ -660,7 +844,8 @@ void screenWeatherSystem(bool newPage) {
   tft.drawString(bufSys, 20, 160);
   
   tft.setTextPadding(300); // Larger padding for API count
-  snprintf(bufSys, sizeof(bufSys), "API Req: %lu OK / %lu FAIL", stats.requestsOk, stats.requestsFail);
+  Stats s = statsSnapshot();
+  snprintf(bufSys, sizeof(bufSys), "API Req: %lu OK / %lu FAIL", s.requestsOk, s.requestsFail);
   tft.drawString(bufSys, 20, 190);
   
   tft.setTextPadding(0);
@@ -683,6 +868,17 @@ void render() {
     case 3: screenWeatherSystem(newPage); break;
   }
   if (dataMutex) xSemaphoreGive(dataMutex);
+}
+
+void queueRangeSave() { rangeSaveDueMs = millis() + RANGE_SAVE_DELAY_MS; }
+
+void flushRangeSave() {
+  if (!rangeSaveDueMs || (int32_t)(millis() - rangeSaveDueMs) < 0) return;
+  rangeSaveDueMs = 0;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  float toSave = radarMaxKm;
+  if (configMutex) xSemaphoreGive(configMutex);
+  prefs.putFloat("range", toSave);
 }
 
 void checkTouch() {
@@ -713,26 +909,33 @@ void checkTouch() {
 
         // Screen-specific touch handling
         if (screen == 2) {
-          // Radar screen: check +/- range buttons (bottom-left, stacked vertically)
-          // "+" button: sx=10..50, sy=160..205
-          if (sx >= 10 && sx <= 50 && sy >= 160 && sy <= 205) {
-            if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-            radarMaxKm = min(200.0f, radarMaxKm + 10.0f);
-            if (configMutex) xSemaphoreGive(configMutex);
-            prefs.putFloat("range", radarMaxKm);
-            Serial.printf("Range increased: %d km\n", (int)radarMaxKm);
-            lastScreenSwap = millis();
-            return;
-          }
-          // "-" button: sx=10..50, sy=206..240
-          if (sx >= 10 && sx <= 50 && sy >= 206 && sy <= 240) {
-            if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-            radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
-            if (configMutex) xSemaphoreGive(configMutex);
-            prefs.putFloat("range", radarMaxKm);
-            Serial.printf("Range decreased: %d km\n", (int)radarMaxKm);
-            lastScreenSwap = millis();
-            return;
+          // Radar screen: +/- range buttons sit side by side along the bottom.
+          // These bounds mirror the rects drawn in screenRadar(), padded a few
+          // pixels for fingertips.
+          if (sy >= RANGE_BTN_Y - RANGE_BTN_PAD &&
+              sy <= RANGE_BTN_Y + RANGE_BTN_H + RANGE_BTN_PAD) {
+            // "-" button, drawn at x=10..40
+            if (sx >= RANGE_MINUS_X - RANGE_BTN_PAD &&
+                sx <= RANGE_MINUS_X + RANGE_BTN_W + RANGE_BTN_PAD) {
+              if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+              radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
+              if (configMutex) xSemaphoreGive(configMutex);
+              queueRangeSave();
+              Serial.printf("Range decreased: %d km\n", (int)radarMaxKm);
+              lastScreenSwap = millis();
+              return;
+            }
+            // "+" button, drawn at x=50..80
+            if (sx >= RANGE_PLUS_X - RANGE_BTN_PAD &&
+                sx <= RANGE_PLUS_X + RANGE_BTN_W + RANGE_BTN_PAD) {
+              if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+              radarMaxKm = min(200.0f, radarMaxKm + 10.0f);
+              if (configMutex) xSemaphoreGive(configMutex);
+              queueRangeSave();
+              Serial.printf("Range increased: %d km\n", (int)radarMaxKm);
+              lastScreenSwap = millis();
+              return;
+            }
           }
         }
 
@@ -747,9 +950,40 @@ void checkTouch() {
 // ---------------------------------------------------------------------------
 // Web Server — Config Page
 // ---------------------------------------------------------------------------
+// Per-boot CSRF token. /save requires it in a custom header, which a
+// cross-origin page cannot set without a preflight the device never allows —
+// so a browser on the LAN can't be used to reconfigure the device silently.
+char csrfToken[17];
+
+void generateCsrfToken() {
+  static const char* hex = "0123456789abcdef";
+  for (int i = 0; i < 16; i++) csrfToken[i] = hex[esp_random() & 0x0F];
+  csrfToken[16] = '\0';
+}
+
+// Returns true when the request carried valid credentials; otherwise it has
+// already been answered with a 401 challenge.
+bool requireAuth() {
+  if (server.authenticate(CONFIG_AUTH_USER, CONFIG_AUTH_PASS)) return true;
+  server.requestAuthentication(DIGEST_AUTH, "CYD Plane Spotter",
+                               "Authentication required");
+  return false;
+}
+
 void initWebServer() {
+  if (strlen(CONFIG_AUTH_PASS) == 0) {
+    Serial.println("CONFIG_AUTH_PASS is empty - web config server disabled. "
+                   "Set it in src/config.env to enable remote configuration.");
+    return;
+  }
+  generateCsrfToken();
+  const char* wantedHeaders[] = {"X-CSRF-Token"};
+  server.collectHeaders(wantedHeaders, 1);
+
   // GET / — serve config page
-  server.on("/", []() {
+  server.on("/", HTTP_GET, []() {
+    if (!requireAuth()) return;
+
     // Snapshot current values
     double hLat, hLon, sRad; float rMax;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
@@ -789,11 +1023,13 @@ void initWebServer() {
 </div>
 <div class="info">IP: )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</div>
 <script>
+var CSRF=")rawliteral" + String(csrfToken) + R"rawliteral(";
 function save(e){
   e.preventDefault();
   var x=new XMLHttpRequest();
   x.open('POST','/save',true);
   x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+  x.setRequestHeader('X-CSRF-Token',CSRF);
   x.onload=function(){
     if(x.status==200){document.getElementById('msg').style.display='block';
     setTimeout(function(){document.getElementById('msg').style.display='none'},3000)}
@@ -809,7 +1045,14 @@ function save(e){
   });
 
   // POST /save — persist new config
-  server.on("/save", []() {
+  server.on("/save", HTTP_POST, []() {
+    if (!requireAuth()) return;
+
+    if (server.header("X-CSRF-Token") != csrfToken) {
+      server.send(403, "text/plain", "Bad CSRF token");
+      return;
+    }
+
     if (!server.hasArg("lat") || !server.hasArg("lon") || !server.hasArg("radius") || !server.hasArg("range")) {
       server.send(400, "text/plain", "Missing fields");
       return;
@@ -835,7 +1078,8 @@ function save(e){
     radarMaxKm = newRng;
     if (configMutex) xSemaphoreGive(configMutex);
 
-    // Persist to NVS
+    // Persist to NVS (supersedes any pending range write from the +/- buttons)
+    rangeSaveDueMs = 0;
     prefs.putDouble("lat", newLat);
     prefs.putDouble("lon", newLon);
     prefs.putDouble("radius", newRad);
@@ -877,6 +1121,7 @@ void setup() {
   connectWiFi();
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   setenv("TZ", TIMEZONE, 1); tzset();
+  waitForClock(30000);
 
   nearest.valid = false;
   newDataReady = false;
@@ -894,6 +1139,7 @@ void setup() {
   // Create mutexes before the task (task uses them)
   dataMutex = xSemaphoreCreateMutex();
   configMutex = xSemaphoreCreateMutex();
+  statsMutex = xSemaphoreCreateMutex();
 
   // Start web config server
   initWebServer();
@@ -902,7 +1148,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     dataFetcherTask,   // Function
     "DataFetch",       // Name
-    16384,             // Stack (16 KB — enough for JSON + SSL)
+    20480,             // Stack (20 KB — JSON + SSL + cert-bundle verification)
     NULL,              // Parameter
     1,                 // Priority
     &fetchTaskHandle,  // Handle
@@ -911,24 +1157,19 @@ void setup() {
 }
 
 void loop() {
-  uint32_t now = millis();
-
   // WiFi health — reconnect if needed (draws to TFT so must be Core 1)
   if (WiFi.status() != WL_CONNECTED) connectWiFi();
 
-  // Weather fetch still runs in loop (it's infrequent, every 10 min)
-  if (!firstWeatherDone || now - lastWeatherPoll >= WEATHER_INTERVAL_MS) {
-    if (WiFi.status() == WL_CONNECTED) fetchWeather();
-    lastWeatherPoll = now; firstWeatherDone = true;
-  }
+  // Weather and aircraft polling both live on the Core 0 fetch task now.
 
   checkTouch();
+  flushRangeSave();
 
   // Serve web config requests
   server.handleClient();
 
   // Auto-screen rotation (re-enabled)
-  //if (now - lastScreenSwap >= SCREEN_SWAP_MS) {
+  //if (millis() - lastScreenSwap >= SCREEN_SWAP_MS) {
   //  screen = (screen + 1) % NUM_SCREENS;
   //  lastScreenSwap = now;
   //}
